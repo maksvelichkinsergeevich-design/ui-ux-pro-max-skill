@@ -1,14 +1,18 @@
-"""Обработчики портфеля: покупки, продажи, статистика."""
+"""Обработчики портфеля: покупки, продажи, статистика, графики, импорт/экспорт."""
 from __future__ import annotations
 
 import asyncio
-from datetime import date
+import io
+from datetime import date, datetime
 
-from telegram import Update
+from telegram import InputFile, Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
+from ..services import charts
+from ..services.charts import ChartPosition
 from ..services.moex import MoexClient
+from ..services.portfolio_io import parse_trades_csv, trades_to_csv
 from ..utils import fmt_money, fmt_pct, pnl_emoji
 from .common import get_db, restricted
 
@@ -172,3 +176,93 @@ async def portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(f"🧾 Всего комиссий: {fmt_money(total_fees)}")
 
     await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+
+
+async def _chart_positions(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> list[ChartPosition]:
+    """Собирает стоимость и P/L открытых позиций по текущим ценам."""
+    db = get_db(context)
+    positions = await asyncio.to_thread(db.positions, user_id)
+    open_positions = [p for p in positions if p.quantity > 0]
+    async with MoexClient() as moex:
+        quotes = await asyncio.gather(*(moex.get_quote(p.ticker) for p in open_positions))
+    out: list[ChartPosition] = []
+    for p, q in zip(open_positions, quotes):
+        mp = q.last if q and q.last else p.avg_price
+        value = mp * p.quantity
+        out.append(ChartPosition(ticker=p.ticker, value=value, pnl=value - p.invested))
+    return out
+
+
+@restricted
+async def chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    positions = await _chart_positions(context, update.effective_user.id)
+    if not positions:
+        await update.effective_message.reply_text(
+            "Портфель пуст — графики строить не из чего. Добавьте покупку: `/add SBER 10 250.5`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    msg = await update.effective_message.reply_text("📈 Рисую графики…")
+    alloc = await asyncio.to_thread(charts.allocation_chart, positions)
+    pnl = await asyncio.to_thread(charts.pnl_chart, positions)
+    await msg.delete()
+    if alloc:
+        await update.effective_message.reply_photo(alloc, caption="Распределение портфеля")
+    if pnl:
+        await update.effective_message.reply_photo(pnl, caption="Прибыль/убыток по позициям")
+
+
+@restricted
+async def export_trades(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db = get_db(context)
+    items = await asyncio.to_thread(db.list_trades, update.effective_user.id)
+    if not items:
+        await update.effective_message.reply_text("Сделок пока нет — нечего выгружать.")
+        return
+    csv_text = trades_to_csv(items)
+    buf = io.BytesIO(csv_text.encode("utf-8-sig"))  # BOM — для корректного Excel
+    fname = f"trades_{datetime.now():%Y%m%d}.csv"
+    await update.effective_message.reply_document(
+        InputFile(buf, filename=fname),
+        caption=f"📤 Экспорт: {len(items)} сделок. Этот же формат принимается в /import.",
+    )
+
+
+@restricted
+async def import_trades(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Импорт сделок из присланного CSV-файла (в т.ч. брокерского отчёта)."""
+    doc = update.effective_message.document
+    if doc is None:
+        await update.effective_message.reply_text(
+            "Пришлите CSV-файл со сделками. Колонки: ticker, side, quantity, price, fee, date "
+            "(или их русские аналоги). Скачать образец можно через /export.",
+        )
+        return
+    if doc.file_size and doc.file_size > 2 * 1024 * 1024:
+        await update.effective_message.reply_text("Файл слишком большой (лимит 2 МБ).")
+        return
+
+    tg_file = await doc.get_file()
+    raw = await tg_file.download_as_bytearray()
+    try:
+        text = bytes(raw).decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = bytes(raw).decode("cp1251", errors="replace")
+
+    result = await asyncio.to_thread(parse_trades_csv, text)
+    if result.errors:
+        await update.effective_message.reply_text("⚠️ " + "\n".join(result.errors))
+        return
+
+    db = get_db(context)
+    uid = update.effective_user.id
+    for tr in result.trades:
+        await asyncio.to_thread(
+            db.add_trade, uid, tr["ticker"], tr["side"], tr["quantity"],
+            tr["price"], tr["fee"], tr["date"], tr["note"],
+        )
+    skipped = f", пропущено строк: {result.skipped}" if result.skipped else ""
+    await update.effective_message.reply_text(
+        f"✅ Импортировано сделок: {len(result.trades)}{skipped}.\n"
+        f"Посмотреть: /trades · статистика: /portfolio"
+    )

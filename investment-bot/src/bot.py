@@ -8,11 +8,11 @@ from zoneinfo import ZoneInfo
 
 from telegram import BotCommand
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from .config import Config, load_config
 from .database import Database
-from .handlers import common, news, portfolio
+from .handlers import common, ideas, news, portfolio
 
 logger = logging.getLogger(__name__)
 
@@ -25,11 +25,16 @@ async def _post_init(app: Application) -> None:
         BotCommand("add", "Записать покупку: ТИКЕР кол-во цена"),
         BotCommand("sell", "Записать продажу: ТИКЕР кол-во цена"),
         BotCommand("portfolio", "Статистика портфеля"),
+        BotCommand("chart", "Графики портфеля"),
         BotCommand("trades", "Список сделок"),
         BotCommand("del", "Удалить сделку по ID"),
+        BotCommand("export", "Выгрузить сделки в CSV"),
+        BotCommand("import", "Импорт сделок из CSV"),
         BotCommand("price", "Котировка: ТИКЕР"),
         BotCommand("dividends", "Дивиденды: ТИКЕР или по портфелю"),
         BotCommand("news", "Сводка новостей: ТИКЕР или по портфелю"),
+        BotCommand("ideas", "Инвест-идеи по динамике и новостям"),
+        BotCommand("bonds", "Топ облигаций по доходности"),
         BotCommand("digest", "Полная сводка"),
         BotCommand("watch", "Наблюдать за компанией: ТИКЕР"),
         BotCommand("unwatch", "Убрать из наблюдения"),
@@ -78,12 +83,18 @@ def build_application(config: Config | None = None) -> Application:
     app.add_handler(CommandHandler("sell", portfolio.add_sell))
     app.add_handler(CommandHandler("portfolio", portfolio.portfolio))
     app.add_handler(CommandHandler(["stats", "stat"], portfolio.portfolio))
+    app.add_handler(CommandHandler("chart", portfolio.chart))
     app.add_handler(CommandHandler("trades", portfolio.trades))
     app.add_handler(CommandHandler(["del", "delete"], portfolio.delete_trade))
+    app.add_handler(CommandHandler("export", portfolio.export_trades))
+    app.add_handler(CommandHandler("import", portfolio.import_trades))
+    app.add_handler(MessageHandler(filters.Document.ALL, portfolio.import_trades))
     # Аналитика
     app.add_handler(CommandHandler("price", news.price))
     app.add_handler(CommandHandler(["dividends", "div"], news.dividends))
     app.add_handler(CommandHandler("news", news.news))
+    app.add_handler(CommandHandler(["ideas", "idea"], ideas.ideas))
+    app.add_handler(CommandHandler("bonds", ideas.bonds))
     app.add_handler(CommandHandler("digest", news.digest))
     # Наблюдение
     app.add_handler(CommandHandler("watch", news.watch))

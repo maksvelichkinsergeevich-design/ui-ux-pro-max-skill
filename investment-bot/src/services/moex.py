@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 
 import httpx
 
@@ -31,6 +31,26 @@ class Dividend:
     value: float
     currency: str
     registry_close: str        # дата закрытия реестра (YYYY-MM-DD)
+
+
+@dataclass
+class Bond:
+    ticker: str                # SECID (напр. SU26238RMFS4)
+    name: str                  # короткое название выпуска
+    yield_pct: float | None    # доходность к погашению, % годовых
+    price_pct: float | None    # цена, % от номинала
+    coupon: float | None       # величина купона, ₽
+    maturity: str              # дата погашения (YYYY-MM-DD)
+    currency: str = "RUB"
+
+
+def _to_float(value) -> float | None:
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _rows(payload: dict, block: str) -> list[dict]:
@@ -125,3 +145,52 @@ class MoexClient:
         """Только предстоящие выплаты (дата закрытия реестра в будущем)."""
         today = date.today().isoformat()
         return [d for d in await self.get_dividends(ticker) if d.registry_close >= today]
+
+    async def get_closes(self, ticker: str, days: int = 120) -> list[tuple[str, float]]:
+        """Дневные цены закрытия за последние `days` дней: [(дата, close), ...]."""
+        ticker = ticker.upper()
+        frm = (date.today() - timedelta(days=days)).isoformat()
+        url = f"{ISS}/engines/stock/markets/shares/boards/TQBR/securities/{ticker}/candles.json"
+        params = {"iss.meta": "off", "from": frm, "interval": 24}
+        try:
+            data = await self._get(url, params)
+        except httpx.HTTPError:
+            return []
+        out: list[tuple[str, float]] = []
+        for r in _rows(data, "candles"):
+            close = _to_float(r.get("close"))
+            begin = str(r.get("begin") or "")[:10]
+            if close is not None and begin:
+                out.append((begin, close))
+        out.sort(key=lambda x: x[0])
+        return out
+
+    async def get_bonds(self, board: str = "TQOB") -> list[Bond]:
+        """Список облигаций с доходностью. TQOB — ОФЗ, TQCB — корпоративные."""
+        url = f"{ISS}/engines/stock/markets/bonds/boards/{board}/securities.json"
+        params = {
+            "iss.meta": "off",
+            "securities.columns": "SECID,SECNAME,MATDATE,COUPONVALUE,FACEUNIT",
+            "marketdata.columns": "SECID,YIELD,LAST",
+        }
+        try:
+            data = await self._get(url, params)
+        except httpx.HTTPError:
+            return []
+        md = {r["SECID"]: r for r in _rows(data, "marketdata")}
+        out: list[Bond] = []
+        for s in _rows(data, "securities"):
+            secid = s.get("SECID")
+            m = md.get(secid, {})
+            out.append(
+                Bond(
+                    ticker=secid,
+                    name=s.get("SECNAME") or secid,
+                    yield_pct=_to_float(m.get("YIELD")),
+                    price_pct=_to_float(m.get("LAST")),
+                    coupon=_to_float(s.get("COUPONVALUE")),
+                    maturity=str(s.get("MATDATE") or ""),
+                    currency=s.get("FACEUNIT") or "RUB",
+                )
+            )
+        return out

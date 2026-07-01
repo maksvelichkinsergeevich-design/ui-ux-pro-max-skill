@@ -35,6 +35,40 @@ class Summarizer:
             blocks.append("\n".join(lines))
         return "\n\n".join(blocks)
 
+    async def rank_ideas(self, metrics_text: str, news_by_ticker: dict[str, list[NewsItem]]) -> str:
+        """Ранжирует кандидатов и объясняет логику. Возвращает готовый текст."""
+        news_block = self._format_input(news_by_ticker) or "Свежих новостей нет."
+        system = (
+            "Ты — инвестиционный аналитик по рынку акций/облигаций Московской биржи. "
+            "На вход — таблица метрик по бумагам (цена, дневное изменение, моментум за 1 и 3 месяца, "
+            "дивидендная доходность, ближайшие дивиденды) и свежие новости. "
+            "Выбери 3–5 наиболее интересных к покупке идей. Для каждой:\n"
+            "• тикер и короткий тезис (1–2 предложения);\n"
+            "• на чём основан (динамика/дивиденды/новости — ссылайся на конкретные метрики и факты);\n"
+            "• ключевой риск.\n"
+            "Оценивай непредвзято, не выдумывай данные, которых нет во входе. "
+            "Пиши сжато, маркированными списками, на русском. "
+            "Обязательно заверши явным дисклеймером: это аналитический разбор, "
+            "а не индивидуальная инвестиционная рекомендация."
+        )
+        from anthropic import AsyncAnthropic
+
+        client = AsyncAnthropic(api_key=self._api_key)
+        try:
+            resp = await client.messages.create(
+                model=self._model,
+                max_tokens=1800,
+                system=system,
+                messages=[{
+                    "role": "user",
+                    "content": f"Метрики по бумагам:\n{metrics_text}\n\nНовости:\n{news_block}",
+                }],
+            )
+            parts = [b.text for b in resp.content if getattr(b, "type", "") == "text"]
+            return "\n".join(parts).strip()
+        finally:
+            await client.close()
+
     async def summarize(self, news_by_ticker: dict[str, list[NewsItem]]) -> str:
         payload = self._format_input(news_by_ticker)
         if not payload.strip():
